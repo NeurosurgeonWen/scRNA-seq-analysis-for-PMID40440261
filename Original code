@@ -1,0 +1,383 @@
+library(Seurat) #version 5.1.0
+library(future)
+library(future.apply)
+library(lme4)
+library(caret)
+library(lmerTest) 
+
+# Reading data
+data_dir <- "Working path saving the data"
+setwd(data_dir)
+data_dirs <- list(
+  Normal = "./cd34_normal_FA",
+  Week2 = "./cd34_FAI2w",
+  Week4 = "./cd34_FAI4w")
+
+# Initialize a list to store Seurat objects
+seurat_list <- list()
+
+# Loop through each dataset to create Seurat objects
+for (time_point in names(data_dirs)) {
+  # Read the data
+  sc_data <- Read10X(data.dir = data_dirs[[time_point]])
+
+  rownames(sc_data) <- toupper(rownames(sc_data))
+  
+  gene_names <- rownames(sc_data)
+  make_unique <- function(names) {
+    make.unique(names, sep = "_")}
+  
+  unique_gene_names <- make_unique(gene_names)
+  rownames(sc_data) <- unique_gene_names
+  
+  # Create a Seurat object with metadata for the time point
+  seurat_obj <- CreateSeuratObject(counts = sc_data, project = time_point, min.features = 100, min.cells = 3)
+  seurat_obj$TimePoint <- time_point
+  
+  # Calculate percentage of mitochondrial genes for QC
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+  
+  seurat_obj <- RenameCells(seurat_obj, add.cell.id = time_point)
+  
+  # Add the Seurat object to the list
+  seurat_list[[time_point]] <- seurat_obj
+}
+
+# Function to perform QC and normalization
+preprocess_seurat <- function(seurat_obj) {
+  # Visualize QC metrics
+  VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+  FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+    FeatureScatter(seurat_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+  
+  # Filter cells based on QC metrics
+  seurat_obj <- subset(seurat_obj, subset = nFeature_RNA > 400 & nFeature_RNA < 6000 
+                       & nCount_RNA < 40000  & percent.mt < 5)
+  
+  # Normalize data
+  seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+  
+  # Identify variable features
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  
+  return(seurat_obj)
+}
+
+# Apply preprocessing to each Seurat object
+seurat_list <- lapply(seurat_list, preprocess_seurat)
+
+
+# Select features for integration
+features <- SelectIntegrationFeatures(object.list = seurat_list, nfeatures = 2000)
+
+# Find integration anchors
+anchors <- FindIntegrationAnchors(object.list = seurat_list, anchor.features = features)
+
+# Integrate data
+seurat_integrated <- IntegrateData(anchorset = anchors)
+
+# Set the default assay to the integrated data
+DefaultAssay(seurat_integrated) <- "integrated"
+
+# Scaling data
+seurat_integrated <- ScaleData(seurat_integrated, verbose = FALSE)
+
+# Run PCA
+seurat_integrated <- RunPCA(seurat_integrated, npcs = 30, verbose = FALSE)
+
+# Find neighbors and clusters
+seurat_integrated <- FindNeighbors(seurat_integrated, dims = 1:30)
+seurat_integrated <- FindClusters(seurat_integrated, resolution = 0.35)
+
+# Run clustering for visualization
+seurat_integrated <- RunTSNE(seurat_integrated, dims = 1:30)
+seurat_integrated <- RunUMAP(seurat_integrated, dims = 1:30)
+
+# Find markers for every cluster compared to all remaining cells
+cluster_markers <- FindAllMarkers(seurat_integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# View top markers for each cluster and identify the VSMC clusters using the marker profiles of
+# cluster 4, 5 and 10 provide by Online Table V: Markers (by avg_logFC) for each cluster in all FA
+# samples aggregated that is downloaded from the following URL:
+#https://www.ahajournals.org/doi/full/10.1161/CIRCRESAHA.121.319494?rfr_dat=cr_pub++0pu#bmed&url_ver=Z39.88-2003&rfr_id=ori%3Arid%3Acrossref.org
+cluster_markers %>% group_by(cluster) %>% top_n(n = 100, wt = avg_log2FC)
+clusters_of_vsmc <- c(......) # Assign the VSMC cluster according to your result of cluster_markers
+
+# Subset the VSMC clusters as a Seurat object
+subset_vsmc <- subset(seurat_integrated, idents = clusters_of_vsmc)
+
+# Define contractile markers for calculation of contractile score
+contractile_markers <- list(
+  VSMC_Specific_Markers = c(
+    "MYH11", "ACTA2", "TAGLN"
+  )
+)
+
+# Calculate module scores for VSMC markers
+subset_vsmc <- AddModuleScore(
+  object = subset_vsmc,
+  features = contractile_markers,
+  name = "VSMC_Score"
+)
+
+# Get normalized expression data for VSMCs
+expr_data <- as.data.frame(t(GetAssayData(subset_vsmc, assay = "integrated", layer = "scale.data")))
+expr_data$Contractile_Score <- subset_vsmc$Contractile_Score1  # Adjust the name if different
+
+# Define function to assign sample ID to each cell
+extract_sample_id <- function(row_name) {
+  if (grepl("Normal", row_name)) {
+    return("Normal")
+  } else if (grepl("Week2", row_name)) {
+    return("Week2")
+  } else if (grepl("Week4", row_name)) {
+    return("Week4")
+  } else {
+    return(NA)
+  }
+}
+
+expr_data$SampleID <- sapply(rownames(expr_data), extract_sample_id)
+
+# Filtering genes expressed in at least 20% VSMCs
+raw_counts <- GetAssayData(subset_vsmc, assay = "RNA", layer = "counts")
+total_cells <- ncol(raw_counts)
+genes_expressed_counts <- rowSums(raw_counts > 0)
+gene_detection_rate <- genes_expressed_counts / total_cells
+genes_ 20pct <- names(gene_detection_rate[gene_detection_rate >= 0.2])
+
+housekeeping_genes <- c(""ACTB", "B2M")
+
+# Define the regression function to perform linear mixed effects model
+regress_gene <- function(gene_name) {
+  
+  # Extract expression for the gene
+  expr_data$Gene_Expression <- expr_data[[gene_name]]
+  
+  # Escape variable names
+  escape_variable <- function(x) {
+  if (grepl("[^[:alnum:]_]", x)) {
+    paste0("`", x, "`")
+  } else {
+    x
+   }
+}
+  hk_genes_escaped <- sapply(housekeeping_genes, escape_variable)
+  target_gene_variable <- escape_variable("Gene_Expression")
+  contractile_score_variable <- escape_variable("Contractile_Score")
+  
+  # Build the regression formulas with escaped variable names
+  formula_lme <- as.formula(
+    paste(contractile_score_variable, "~", target_gene_variable, "+", paste(hk_genes_escaped, collapse = " + "), "+ (1 | SampleID)")
+  )
+
+  # Perform linear mixed effects model
+  lme_model <- try(lmer(formula_lme, data = expr_data), silent = TRUE)
+  if (inherits(lme_model, "try-error")) {
+    lme_beta <- NA
+    lme_p_value <- NA
+    lme_vip <- NA
+  } else {
+    # Use 'coef(summary(lme_model))' to get coefficients with p-values
+    coef_summary <- coef(summary(lme_model))
+    idx <- match("Gene_Expression", rownames(coef_summary))
+    if (is.na(idx)) {
+      lme_beta <- NA
+      lme_p_value <- NA
+      lme_vip <- NA
+    } else {
+      lme_beta <- coef_summary[idx, "Estimate"]
+      lme_p_value <- coef_summary[idx, "Pr(>|t|)"]
+      
+      # Approximate variable importance using t-values
+      t_values <- coef_summary[, "t value"]
+      names(t_values) <- rownames(coef_summary)
+      lme_vip <- abs(t_values["Gene_Expression"])
+    }
+  }
+  
+  # Return the results
+  list(
+    Gene = gene_name,
+    lme_beta = lme_beta,
+    lme_p_value = lme_p_value,
+    lme_vip = lme_vip
+  )
+}
+
+# Use future_lapply for parallel processing
+results <- future_lapply(all_genes, regress_gene)
+
+# Store linear mixed effects model results to investigate the gene with estimated beta 
+# coefficient for the fixed effect of each input gene measured gene-specific changes in the 
+# contraction score, and with Bonferroni-adjusted p-value.
+regression_results <- data.frame(
+  Gene = sapply(results, function(x) x$Gene),
+  Beta = sapply(results, function(x) x$lme_beta),
+  P_Value = sapply(results, function(x) x$lme_p_value),
+  VIP = sapply(results, function(x) x$lme_vip)
+)
+regression_results$p_adjust <- p.adjust(lme_results$P_Value, method = "bonferroni")
+
+# Trajectory analysis
+library(Seurat)
+library(monocle3)
+library(dplyr)
+library(ggplot2)
+library(slingshot)
+library(reshape2)
+library(RColorBrewer)
+
+# Re-cluster the VSMC into three cluster (Adjusting appropriate parameter “dims” or “resolution” # until 3 clusters of VSMC are identified. 
+vsmc_seurat <- FindNeighbors(subset_vsmc, dims = 1:20)
+vsmc_seurat <- FindClusters(subset_vsmc, resolution = 0.25)
+
+# Find markers for every cluster compared to all remaining cells
+cluster_markers <- FindAllMarkers(vsmc_seurat, only.pos = TRUE, min.pct = 0.10, logfc.threshold = 0.25)
+
+# View top markers for each cluster
+# Rename according to the expression level of contractile and synthetic/proliferative markers
+cluster_markers %>% group_by(cluster) %>% top_n(n = 100, wt = avg_log2FC)
+vsmc_seurat <- RenameIdents(vsmc_seurat, 
+                            `...` = "Contractile cluster",
+                            `...` = "Synthetic cluster",
+                            `...` = "De-differentiated cluster" )
+
+# Visualize the phenotypic markers for the reclustered VSMC
+target_genes_plot <-  c('MYH11', 'ACTA2', 'CNN1', 'TAGLN', 'TPM2', 'SMTN', 'ACTG2', 'MYLK', 'DMPK', 'LMOD1', 'MYL9', 'MMP2', 'MMP3', 'VCAM1', 'ICAM1', 'CXCL1', 'KLF5', 'KLF4', 'CXCL12')
+DotPlot(
+  object = vsmc_seurat,
+  features = target_genes_plot,
+  cluster.idents=TRUE,
+  cols = c("lightblue", "darkblue"),
+  dot.scale = 8
+) + 
+  RotatedAxis() + 
+  ggtitle("Phenotypic markers in re-clustered extracted VSMCs") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Convert Seurat object to SingleCellExperiment
+sce <- as.SingleCellExperiment(vsmc_seurat)
+
+# Add cluster labels to colData (using the desired cluster assignment column)
+sce$clusters <- Idents(vsmc_seurat)
+
+# Add UMAP embeddings to reducedDims
+reducedDims(sce)$TSNE <- Embeddings(vsmc_seurat, "tsne")
+reducedDims(sce)$UMAP <- Embeddings(vsmc_seurat, "umap")
+
+# Specify the root cluster
+root_cluster <- "Contractile cluster"  
+
+# Run Slingshot
+sce <- slingshot(
+  sce,
+  clusterLabels = 'clusters',
+  reducedDim = 'TSNE',
+  start.clus = root_cluster
+)
+
+sce <- slingshot(
+  sce,
+  clusterLabels = 'clusters',
+  reducedDim = 'UMAP',
+  start.clus = root_cluster
+)
+
+# Define colors for clusters
+cluster_levels <- levels(sce$clusters)
+cluster_colors <- brewer.pal(n = length(cluster_levels), name = "Set1")
+names(cluster_colors) <- cluster_levels
+cluster_colors <- c("#377EB8", "#E41A1C")
+
+# Plot UMAP with Slingshot trajectories
+plot(
+  reducedDims(sce)$UMAP,
+  col = cluster_colors[sce$clusters],
+  pch = 16,
+  cex = 0.5,
+  asp = 1,
+  main = "Slingshot Trajectory on UMAP"
+)
+lines(SlingshotDataSet(sce), lwd = 2, col = 'skyblue')
+legend('topright', legend = names(cluster_colors), col = cluster_colors, pch = 16)
+
+# Extract pseudotime values
+pseudotime <- slingPseudotime(sce)
+# Select the first lineage if multiple lineages exist
+pseudotime_values <- pseudotime[, 1]
+
+# Add pseudotime to the Seurat object metadata
+vsmc_seurat$pseudotime <- pseudotime_values[colnames(vsmc_seurat)]
+
+# Define target genes as “NEXN”
+target_genes <- c("NEXN") 
+
+# Check which target genes are present
+genes_present <- intersect(target_genes, rownames(sce))
+
+# Extract expression data for genes of interest
+data_mat <- GetAssayData(vsmc_seurat, assay = "RNA", layer = "data")
+
+# Ensure 'genes_present' is not empty
+if (length(genes_present) == 0) {
+  stop("None of the target genes are present in the dataset.")
+}
+
+# Subset 'data_mat' to genes of interest, ensuring the result is a matrix
+expression_data <- data_mat[genes_present, , drop = FALSE]
+expression_data <- as.matrix(expression_data)
+
+# Order cells by pseudotime
+cell_order <- order(vsmc_seurat$pseudotime, na.last = NA)
+
+# Ensure 'cell_order' is not empty
+if (length(cell_order) == 0) {
+  stop("No cells have valid pseudotime values.")
+}
+
+# Subset 'expression_data' by ordered cells, keeping dimensions
+ordered_expression <- expression_data[, cell_order, drop = FALSE]
+
+# Get ordered pseudotime values
+ordered_pseudotime <- vsmc_seurat$pseudotime[cell_order]
+
+# Extract cluster assignments
+clusters <- sce$clusters[colnames(sce)]
+
+# Ensure clusters are aligned with pseudotime values
+ordered_clusters <- clusters[cell_order]
+
+# Create a data frame combining pseudotime, clusters, and expression data
+expression_df <- data.frame(
+  Pseudotime = ordered_pseudotime,
+  Cluster = ordered_clusters,
+  t(ordered_expression))
+
+# Melt the data for ggplot
+expression_melted <- melt(
+  expression_df,
+  id.vars = c("Pseudotime", "Cluster"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+# Define colors for clusters
+cluster_levels <- levels(as.factor(sce$clusters))
+# cluster_colors <- brewer.pal(n = length(cluster_levels), name = "Set1")
+cluster_colors<- c("#377EB8", "#E41A1C") 
+names(cluster_colors) <- cluster_levels
+
+# Plot gene expression over pseudotime colored by clusters
+ggplot(expression_melted, aes(x = Pseudotime, y = Expression, color = Cluster)) +
+  geom_point(alpha = 0.6, size = 0.95) +
+  # geom_smooth(aes(group = Gene), method = "loess", span = 0.3, se = FALSE, color = "black") +
+  facet_wrap(~ Gene, scales = "free_y", ncol = 1) +
+  theme_minimal() +
+  labs(
+    title = "NEXN Expression Over Pseudotime by Cluster",
+    y = "Expression",
+    x = "Pseudotime"
+  ) +
+  scale_color_manual(values = cluster_colors) +
+  theme(legend.position = "right")
