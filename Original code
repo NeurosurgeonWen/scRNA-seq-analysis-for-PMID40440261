@@ -6,7 +6,7 @@ library(caret)
 library(lmerTest) 
 
 # Reading data
-data_dir <- "Working path saving the data"
+data_dir <- "Working path saving the data of GSE182232 released from GSE182232_RAW.tar (GSE182232)"
 setwd(data_dir)
 data_dirs <- list(
   Normal = "./cd34_normal_FA",
